@@ -1,12 +1,10 @@
 #include "expression.h"
 
-#include <ctype.h> /* for isspace */
-#include <limits.h>
-#include <math.h> /* for pow */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
+#include <linux/ctype.h> /* for isspace */
+#include <linux/kernel.h>
+#include <linux/limits.h>
+#include <linux/module.h>
+#include <linux/string.h>
 /*
  * Expression data types
  */
@@ -137,7 +135,7 @@ static enum expr_type expr_op(const char *s, size_t len, int unary)
 
 static unsigned expr_parse_number(const char *s, size_t len)
 {
-    float num = 0;
+    unsigned num = 0;
     unsigned int frac = 0;
     unsigned int digits = 0;
     for (unsigned int i = 0; i < len; i++) {
@@ -201,7 +199,7 @@ struct expr_var *expr_var(struct expr_var_list *vars, const char *s, size_t len)
     return v;
 }
 
-static int to_int(float x)
+static int to_int(unsigned x)
 {
     if (isnan(x)) {
         return 0;
@@ -211,9 +209,9 @@ static int to_int(float x)
     return (int) x;
 }
 
-float expr_eval(struct expr *e)
+unsigned expr_eval(struct expr *e)
 {
-    float n;
+    unsigned n;
     switch (e->type) {
     case OP_UNARY_MINUS:
         return -(expr_eval(&e->param.op.args.buf[0]));
@@ -435,7 +433,7 @@ static int expr_bind(const char *s, size_t len, vec_expr_t *es)
     return 0;
 }
 
-static struct expr expr_const(float value)
+static struct expr expr_const(unsigned value)
 {
     struct expr e = expr_init();
     e.type = OP_CONST;
@@ -497,7 +495,7 @@ struct expr *expr_create(const char *s,
                          struct expr_var_list *vars,
                          struct expr_func *funcs)
 {
-    float num;
+    unsigned num;
     struct expr_var *v;
     const char *id = NULL;
     size_t idn = 0;
