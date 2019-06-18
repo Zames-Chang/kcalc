@@ -1,8 +1,5 @@
-#include <linux/slab.h>
-
 #ifndef EXPRESSION_H_
 #define EXPRESSION_H_
-
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,11 +23,12 @@ extern "C" {
 #define vec_nth(v, i) (v)->buf[i]
 #define vec_peek(v) (v)->buf[(v)->len - 1]
 #define vec_pop(v) (v)->buf[--(v)->len]
-#define vec_free(v) (free((v)->buf), (v)->buf = NULL, (v)->len = (v)->cap = 0)
+#define vec_free(v) (kfree((v)->buf), (v)->buf = NULL, (v)->len = (v)->cap = 0)
 #define vec_foreach(v, var, iter)                                              \
     if ((v)->len > 0)                                                          \
         for ((iter) = 0; (iter) < (v)->len && (((var) = (v)->buf[(iter)]), 1); \
              ++(iter))
+#include <linux/slab.h>
 
 /* Simple expandable vector implementation */
 static inline int vec_expand(char **buf, int *length, int *cap, int memsz)
@@ -54,18 +52,16 @@ static inline int vec_expand(char **buf, int *length, int *cap, int memsz)
 struct expr_func;
 typedef vec(struct expr) vec_expr_t;
 typedef void (*exprfn_cleanup_t)(struct expr_func *f, void *context);
-typedef unsigned (*exprfn_t)(struct expr_func *f,
-                             vec_expr_t args,
-                             void *context);
+typedef int (*exprfn_t)(struct expr_func *f, vec_expr_t args, void *context);
 
 struct expr {
     int type;
     union {
         struct {
-            unsigned value;
+            int value;
         } num;
         struct {
-            unsigned *value;
+            int *value;
         } var;
         struct {
             vec_expr_t args;
@@ -107,7 +103,7 @@ struct expr_func *expr_func(struct expr_func *funcs, const char *s, size_t len);
  * Variables
  */
 struct expr_var {
-    unsigned value;
+    int value;
     struct expr_var *next;
     char name[];
 };
@@ -120,7 +116,7 @@ struct expr_var *expr_var(struct expr_var_list *vars,
                           const char *s,
                           size_t len);
 
-unsigned expr_eval(struct expr *e);
+int expr_eval(struct expr *e);
 
 #define EXPR_TOP (1 << 0)
 #define EXPR_TOPEN (1 << 1)

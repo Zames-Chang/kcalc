@@ -5,9 +5,49 @@
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/string.h>
+#define GET_NUM(n) ((n) >> 4)
+#define NAN_INT ((1 << 4) | ((1 << 4) - 1))
+#define INF_INT ((1 << 5) | ((1 << 4) - 1))
+#define MASK(n) (((n) > 0) << 4)
+/*
+ * lsb 4 byte for precision, 2^3, one for sign
+ * msb 28 byte for integer
+ * lsb all 1 is NAN
+ */
+
 /*
  * Expression data types
  */
+
+int GET_FRAC(int n)
+{
+    int x = n & 15;
+    if (x & 8)
+        return -(((~x) & 15) + 1);
+
+    return x;
+}
+
+int FP2INT(int n, int d)
+{
+    while (n && n % 10 == 0) {
+        ++d;
+        n /= 10;
+    }
+    if (d == -1) {
+        n *= 10;
+        --d;
+    }
+
+    return ((n << 4) | (d & 15));
+}
+
+int isNan(int x)
+{
+    return GET_FRAC(x) == GET_FRAC(NAN_INT);
+}
+
+enum compare_type { LOWER = 1, EQUAL = 2, GREATER = 4 };
 
 enum expr_type {
     OP_UNKNOWN,
@@ -133,31 +173,31 @@ static enum expr_type expr_op(const char *s, size_t len, int unary)
     return OP_UNKNOWN;
 }
 
-static unsigned expr_parse_number(const char *s, size_t len)
+static int expr_parse_number(const char *s, size_t len)
 {
-    unsigned num = 0;
-    unsigned int frac = 0;
+    int num = 0;
+    int frac = 0;
+    int dot = 0;  // FIXME: not good enough
+    int temp;
     unsigned int digits = 0;
     for (unsigned int i = 0; i < len; i++) {
-        if (s[i] == '.' && frac == 0) {
-            frac++;
+        if (s[i] == '.' && dot == 0) {
+            dot = 1;
             continue;
         }
         if (isdigit(s[i])) {
             digits++;
-            if (frac > 0) {
-                frac++;
+            if (dot) {
+                --frac;
             }
+            temp = num;
             num = num * 10 + (s[i] - '0');
         } else {
-            return NAN;
+            return NAN_INT;
         }
     }
-    while (frac > 1) {
-        num = num / 10;
-        frac--;
-    }
-    return (digits > 0 ? num : NAN);
+    num = FP2INT(num, frac);
+    return (digits > 0 ? num : NAN_INT);
 }
 
 /*
@@ -188,7 +228,8 @@ struct expr_var *expr_var(struct expr_var_list *vars, const char *s, size_t len)
             return v;
         }
     }
-    v = (struct expr_var *) calloc(1, sizeof(struct expr_var) + len + 1);
+    v = (struct expr_var *) kcalloc(1, sizeof(struct expr_var) + len + 1,
+                                    GFP_KERNEL);
     if (!v)
         return NULL; /* allocation failed */
     v->next = vars->head;
@@ -199,104 +240,339 @@ struct expr_var *expr_var(struct expr_var_list *vars, const char *s, size_t len)
     return v;
 }
 
-static int to_int(unsigned x)
+int mult(int a, int b)
 {
-    if (isnan(x)) {
-        return 0;
-    } else if (isinf(x) != 0) {
-        return INT_MAX * isinf(x);
-    }
-    return (int) x;
+    if (a == INF_INT || b == INF_INT)
+        return INF_INT;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    int n3 = n1 * n2;
+    if (n3 >= (1 << 28))
+        return INF_INT;
+    return FP2INT(n3, (frac1 + frac2));
 }
 
-unsigned expr_eval(struct expr *e)
+int divid(int a, int b)
 {
-    unsigned n;
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    int sign = 1;
+    printk("a : %d b : %d", a, b);
+    printk("n1 : %d n2 : %d frac1 : %d frac2 : %d", n1, n2, frac1, frac2);
+    if (n1 == 0 && n2 == 0)
+        return NAN_INT;
+    if (n1 == NAN_INT || n2 == NAN_INT)
+        return NAN_INT;
+    if (n2 == 0)
+        return INF_INT;
+
+    // check if there is negative number
+    if (n1 < 0) {
+        sign = -sign;
+        n1 = -n1;
+    }
+    if (n2 < 0) {
+        sign = -sign;
+        n2 = -n2;
+    }
+
+    while (n1 * 10 < ((1 << 25) - 1)) {
+        --frac1;
+        n1 *= 10;
+    }
+    int n3 = (n1 / n2) * sign;
+    int frac3 = frac1 - frac2;
+
+    return FP2INT(n3, frac3);
+}
+
+int remain(int a, int b)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    if (n2 == 0)
+        return NAN_INT;
+
+    // to int
+    while (frac1 > 0) {
+        n1 /= 10;
+        --frac1;
+    }
+    while (frac2 > 0) {
+        n2 /= 10;
+        --frac2;
+    }
+
+    n1 %= n2;
+
+    return FP2INT(n1, frac1);
+}
+
+int right_shift(int a, int b)
+{
+    // FIXME: should use 2-base?
+    return divid(a, mult(2 << 4, b));
+}
+
+int power(int a, int b)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+
+    while (frac2 != 0) {
+        if (frac2 < 0) {
+            n2 /= 10;
+            ++frac2;
+        } else {
+            n2 *= 10;
+            --frac2;
+        }
+    }
+
+    int on1 = n1;
+    int of1 = frac1;
+    n1 = 1;
+    for (int i = 0; i < n2; ++i) {
+        frac1 += of1;
+        n1 *= on1;
+    }
+    return FP2INT(n1, frac1);
+}
+
+int left_shift(int a, int b)
+{
+    // FIXME: should use 2-base?
+    return mult(a, power(2 << 4, b));
+}
+
+int plus(int a, int b)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+
+    while (frac1 != frac2) {
+        if (frac1 > frac2) {
+            --frac1;
+            n1 *= 10;
+        } else if (frac1 < frac2) {
+            --frac2;
+            n2 *= 10;
+        }
+    }
+
+    n1 += n2;
+    printk("n1 : %d\n", n1);
+    if (n1 > 1 << 28)
+        return INF_INT;
+    return FP2INT(n1, frac1);
+}
+
+int minus(int a, int b)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+
+    while (frac1 != frac2) {
+        if (frac1 > frac2) {
+            --frac1;
+            n1 *= 10;
+        } else {
+            --frac2;
+            n2 *= 10;
+        }
+    }
+
+    n1 -= n2;
+    return FP2INT(n1, frac1);
+}
+
+int compare(int a, int b)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    while (frac1 != frac2) {
+        if (frac1 > frac2) {
+            --frac1;
+            n1 *= 10;
+        } else {
+            --frac2;
+            n2 *= 10;
+        }
+    }
+
+    int flags = 0;
+    if (n1 < n2)
+        flags |= LOWER;
+    if (n1 > n2)
+        flags |= GREATER;
+    if (n1 == n2)
+        flags |= EQUAL;
+
+    return flags;
+}
+
+int bitwise_op(int a, int b, int op)
+{
+    int frac1 = GET_FRAC(a);
+    int frac2 = GET_FRAC(b);
+    int n1 = GET_NUM(a);
+    int n2 = GET_NUM(b);
+    if (op == 1 && (a == INF_INT || b == INF_INT))
+        return INF_INT;
+    if (op == 1 && (a == NAN_INT || b == NAN_INT))
+        return 0;
+    if (frac1 == -1 || frac2 == -1)
+        return NAN_INT;
+
+    // to int
+    while (frac1 > 0) {
+        n1 /= 10;
+        --frac1;
+    }
+    while (frac2 > 0) {
+        n2 /= 10;
+        --frac2;
+    }
+
+    if (op == 0)
+        n1 &= n2;
+    else if (op == 1)
+        n1 |= n2;
+    else if (op == 2)
+        n1 ^= n2;
+    else if (op == 3)
+        n1 = ~n1;
+
+    while (n1 && n1 % 10 == 0) {
+        ++frac1;
+        n1 /= 10;
+    }
+
+    if (frac1 == -1) {
+        n1 *= 10;
+        --frac1;
+    }
+
+    return FP2INT(n1, frac1);
+}
+
+int not(int a)
+{
+    int frac = GET_FRAC(a);
+    int n = GET_NUM(a);
+
+    return FP2INT(!n, frac);
+}
+
+// TODO: change logic
+int expr_eval(struct expr *e)
+{
+    int n;
     switch (e->type) {
-    case OP_UNARY_MINUS:
-        return -(expr_eval(&e->param.op.args.buf[0]));
-    case OP_UNARY_LOGICAL_NOT:
-        return !(expr_eval(&e->param.op.args.buf[0]));
-    case OP_UNARY_BITWISE_NOT:
-        return ~(to_int(expr_eval(&e->param.op.args.buf[0])));
+    case OP_UNARY_MINUS:  // OK
+        return minus(FP2INT(0, 0), expr_eval(&e->param.op.args.buf[0]));
+    case OP_UNARY_LOGICAL_NOT:  // OK
+        return not(expr_eval(&e->param.op.args.buf[0]));
+    case OP_UNARY_BITWISE_NOT:  // OK
+        return bitwise_op(expr_eval(&e->param.op.args.buf[0]), 0, 3);
     case OP_POWER:
-        return powf(expr_eval(&e->param.op.args.buf[0]),
-                    expr_eval(&e->param.op.args.buf[1]));
-    case OP_MULTIPLY:
-        return expr_eval(&e->param.op.args.buf[0]) *
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_DIVIDE:
-        return expr_eval(&e->param.op.args.buf[0]) /
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_REMAINDER:
-        return fmodf(expr_eval(&e->param.op.args.buf[0]),
+        return power(expr_eval(&e->param.op.args.buf[0]),
                      expr_eval(&e->param.op.args.buf[1]));
-    case OP_PLUS:
-        return expr_eval(&e->param.op.args.buf[0]) +
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_MINUS:
-        return expr_eval(&e->param.op.args.buf[0]) -
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_SHL:
-        return to_int(expr_eval(&e->param.op.args.buf[0]))
-               << to_int(expr_eval(&e->param.op.args.buf[1]));
-    case OP_SHR:
-        return to_int(expr_eval(&e->param.op.args.buf[0])) >>
-               to_int(expr_eval(&e->param.op.args.buf[1]));
-    case OP_LT:
-        return expr_eval(&e->param.op.args.buf[0]) <
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_LE:
-        return expr_eval(&e->param.op.args.buf[0]) <=
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_GT:
-        return expr_eval(&e->param.op.args.buf[0]) >
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_GE:
-        return expr_eval(&e->param.op.args.buf[0]) >=
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_EQ:
-        return expr_eval(&e->param.op.args.buf[0]) ==
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_NE:
-        return expr_eval(&e->param.op.args.buf[0]) !=
-               expr_eval(&e->param.op.args.buf[1]);
-    case OP_BITWISE_AND:
-        return to_int(expr_eval(&e->param.op.args.buf[0])) &
-               to_int(expr_eval(&e->param.op.args.buf[1]));
-    case OP_BITWISE_OR:
-        return to_int(expr_eval(&e->param.op.args.buf[0])) |
-               to_int(expr_eval(&e->param.op.args.buf[1]));
-    case OP_BITWISE_XOR:
-        return to_int(expr_eval(&e->param.op.args.buf[0])) ^
-               to_int(expr_eval(&e->param.op.args.buf[1]));
-    case OP_LOGICAL_AND:
+    case OP_MULTIPLY:  // OK
+        return mult(expr_eval(&e->param.op.args.buf[0]),
+                    expr_eval(&e->param.op.args.buf[1]));
+    case OP_DIVIDE:  // OK, precision
+        return divid(expr_eval(&e->param.op.args.buf[0]),
+                     expr_eval(&e->param.op.args.buf[1]));
+    case OP_REMAINDER:  // OK, no floating point
+        return remain(expr_eval(&e->param.op.args.buf[0]),
+                      expr_eval(&e->param.op.args.buf[1]));
+    case OP_PLUS:  // OK
+        return plus(expr_eval(&e->param.op.args.buf[0]),
+                    expr_eval(&e->param.op.args.buf[1]));
+    case OP_MINUS:  // OK
+        return minus(expr_eval(&e->param.op.args.buf[0]),
+                     expr_eval(&e->param.op.args.buf[1]));
+    case OP_SHL:  // oK
+        return left_shift(expr_eval(&e->param.op.args.buf[0]),
+                          expr_eval(&e->param.op.args.buf[1]));
+    case OP_SHR:  // OK
+        return right_shift(expr_eval(&e->param.op.args.buf[0]),
+                           expr_eval(&e->param.op.args.buf[1]));
+    case OP_LT:  // OK
+        return MASK(compare(expr_eval(&e->param.op.args.buf[0]),
+                            expr_eval(&e->param.op.args.buf[1])) &
+                    (LOWER));
+    case OP_LE:  // OK
+        return MASK(compare(expr_eval(&e->param.op.args.buf[0]),
+                            expr_eval(&e->param.op.args.buf[1])) &
+                    (LOWER | EQUAL));
+    case OP_GT:  // OK
+        return MASK(compare(expr_eval(&e->param.op.args.buf[0]),
+                            expr_eval(&e->param.op.args.buf[1])) &
+                    (GREATER));
+    case OP_GE:  // OK
+        return MASK(compare(expr_eval(&e->param.op.args.buf[0]),
+                            expr_eval(&e->param.op.args.buf[1])) &
+                    (GREATER | EQUAL));
+    case OP_EQ:  // OK
+        return MASK(compare(expr_eval(&e->param.op.args.buf[0]),
+                            expr_eval(&e->param.op.args.buf[1])) &
+                    (EQUAL));
+    case OP_NE:  // OK
+        return MASK(!(compare(expr_eval(&e->param.op.args.buf[0]),
+                              expr_eval(&e->param.op.args.buf[1])) &
+                      (EQUAL)));
+    case OP_BITWISE_AND:  // OK
+        return (bitwise_op(expr_eval(&e->param.op.args.buf[0]),
+                           expr_eval(&e->param.op.args.buf[1]), 0));
+    case OP_BITWISE_OR:  // OK
+        return MASK(bitwise_op(expr_eval(&e->param.op.args.buf[0]),
+                               expr_eval(&e->param.op.args.buf[1]), 1));
+    case OP_BITWISE_XOR:  // OK
+        return (bitwise_op(expr_eval(&e->param.op.args.buf[0]),
+                           expr_eval(&e->param.op.args.buf[1]), 2));
+    case OP_LOGICAL_AND:  // OK
         n = expr_eval(&e->param.op.args.buf[0]);
-        if (n != 0) {
+        if (GET_NUM(n) != 0) {
             n = expr_eval(&e->param.op.args.buf[1]);
-            if (n != 0) {
+            if (GET_NUM(n) != 0) {
                 return n;
             }
         }
         return 0;
-    case OP_LOGICAL_OR:
+    case OP_LOGICAL_OR:  // OK
         n = expr_eval(&e->param.op.args.buf[0]);
-        if (n != 0 && !isnan(n)) {
+        if (GET_NUM(n) != 0 && !isNan(n)) {
             return n;
         } else {
             n = expr_eval(&e->param.op.args.buf[1]);
-            if (n != 0) {
+            if (GET_NUM(n) != 0) {
                 return n;
             }
         }
         return 0;
-    case OP_ASSIGN:
+    case OP_ASSIGN:  // OK
         n = expr_eval(&e->param.op.args.buf[1]);
         if (vec_nth(&e->param.op.args, 0).type == OP_VAR) {
             *e->param.op.args.buf[0].param.var.value = n;
         }
         return n;
-    case OP_COMMA:
+    case OP_COMMA:  // OK
         expr_eval(&e->param.op.args.buf[0]);
         return expr_eval(&e->param.op.args.buf[1]);
     case OP_CONST:
@@ -307,7 +583,7 @@ unsigned expr_eval(struct expr *e)
         return e->param.func.f->f(e->param.func.f, e->param.func.args,
                                   e->param.func.context);
     default:
-        return NAN;
+        return NAN_INT;
     }
 }
 
@@ -433,7 +709,7 @@ static int expr_bind(const char *s, size_t len, vec_expr_t *es)
     return 0;
 }
 
-static struct expr expr_const(unsigned value)
+static struct expr expr_const(int value)
 {
     struct expr e = expr_init();
     e.type = OP_CONST;
@@ -473,7 +749,8 @@ static inline void expr_copy(struct expr *dst, struct expr *src)
             vec_push(&dst->param.func.args, tmp);
         }
         if (src->param.func.f->ctxsz > 0) {
-            dst->param.func.context = calloc(1, src->param.func.f->ctxsz);
+            dst->param.func.context =
+                kcalloc(1, src->param.func.f->ctxsz, GFP_KERNEL);
         }
     } else if (src->type == OP_CONST) {
         dst->param.num.value = src->param.num.value;
@@ -495,7 +772,7 @@ struct expr *expr_create(const char *s,
                          struct expr_var_list *vars,
                          struct expr_func *funcs)
 {
-    unsigned num;
+    int num;
     struct expr_var *v;
     const char *id = NULL;
     size_t idn = 0;
@@ -682,7 +959,7 @@ struct expr *expr_create(const char *s,
                         bound_func.param.func.f = f;
                         bound_func.param.func.args = arg.args;
                         if (f->ctxsz > 0) {
-                            void *p = calloc(1, f->ctxsz);
+                            void *p = kcalloc(1, f->ctxsz, GFP_KERNEL);
                             if (!p) {
                                 goto cleanup; /* allocation failed */
                             }
@@ -693,7 +970,7 @@ struct expr *expr_create(const char *s,
                 }
             }
             paren_next = EXPR_PAREN_FORBIDDEN;
-        } else if (!isnan(num = expr_parse_number(tok, n))) {
+        } else if (!isNan(num = expr_parse_number(tok, n))) {
             vec_push(&es, expr_const(num));
             paren_next = EXPR_PAREN_FORBIDDEN;
         } else if (expr_op(tok, n, -1) != OP_UNKNOWN) {
@@ -754,7 +1031,7 @@ struct expr *expr_create(const char *s,
         }
     }
 
-    result = (struct expr *) calloc(1, sizeof(struct expr));
+    result = (struct expr *) kcalloc(1, sizeof(struct expr), GFP_KERNEL);
     if (result) {
         if (vec_len(&es) == 0) {
             result->type = OP_CONST;
@@ -809,7 +1086,7 @@ static void expr_destroy_args(struct expr *e)
                 e->param.func.f->cleanup(e->param.func.f,
                                          e->param.func.context);
             }
-            free(e->param.func.context);
+            kfree(e->param.func.context);
         }
     } else if (e->type != OP_CONST && e->type != OP_VAR) {
         vec_foreach (&e->param.op.args, arg, i) {
@@ -823,12 +1100,12 @@ void expr_destroy(struct expr *e, struct expr_var_list *vars)
 {
     if (e) {
         expr_destroy_args(e);
-        free(e);
+        kfree(e);
     }
     if (vars) {
         for (struct expr_var *v = vars->head; v;) {
             struct expr_var *next = v->next;
-            free(v);
+            kfree(v);
             v = next;
         }
     }

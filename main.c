@@ -94,13 +94,12 @@ static ssize_t dev_write(struct file *filep,
     size_of_message = 0;
     memset(message, 0, sizeof(char) * BUFF_SIZE);
 
-    snprintf(message, BUFF_SIZE, "%s", buffer);
+    // snprintf(message, BUFF_SIZE, "%s", buffer);
+    copy_from_user(message, buffer, BUFF_SIZE);
     size_of_message = strlen(message);
     printk(KERN_INFO "CALC: Received %d -> %s\n", size_of_message, message);
 
-    if (size_of_message >= 3) {
-        calc();
-    }
+    calc();
     return len;
 }
 
@@ -112,8 +111,9 @@ static void calc(void)
         printk(KERN_ALERT "Syntax error");
         return;
     }
+
     result = expr_eval(e);
-    printk(KERN_INFO "Result: %d\n", result);
+    printk(KERN_INFO "Result: %x\n", result);
 }
 
 static int dev_release(struct inode *inodep, struct file *filep)
